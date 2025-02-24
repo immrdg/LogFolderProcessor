@@ -12,7 +12,12 @@ interface FileProcessorProps {
 interface FolderStats {
   name: string;
   fileCount: number;
-  files: string[];
+  insertCount: number;
+  updateCount: number;
+  files: Array<{
+    name: string;
+    operation: 'insert' | 'update';
+  }>;
 }
 
 interface TreeNode {
@@ -20,6 +25,12 @@ interface TreeNode {
   type: 'file' | 'folder';
   children?: TreeNode[];
   path: string;
+  fileStats?: {
+    empty: number;
+    nonEmpty: number;
+    total: number;
+  };
+  size?: number;
 }
 
 type TabType = 'input' | 'output' | 'logs';
@@ -35,6 +46,7 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   const [showBatchIdModal, setShowBatchIdModal] = useState(false);
   const [fileTree, setFileTree] = useState<TreeNode[]>([]);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
+  const [expandedOutputFolders, setExpandedOutputFolders] = useState<Set<string>>(new Set(['processed_files']));
 
   const addDebugLog = (message: string) => {
     setDebug(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
@@ -52,6 +64,26 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     });
   };
 
+  const toggleOutputFolder = (folderName: string) => {
+    setExpandedOutputFolders(prev => {
+      const next = new Set(prev);
+      if (next.has(folderName)) {
+        next.delete(folderName);
+      } else {
+        next.add(folderName);
+      }
+      return next;
+    });
+  };
+
+  const calculateFileStats = async (file: JSZip.JSZipObject): Promise<{ isEmpty: boolean; size: number }> => {
+    const content = await file.async('uint8array');
+    return {
+      isEmpty: content.length === 0,
+      size: content.length
+    };
+  };
+
   const buildFileTree = async (file: File) => {
     addDebugLog(`Building file tree for ${file.name}`);
     const tree: TreeNode[] = [];
@@ -61,16 +93,16 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
         const zip = await JSZip.loadAsync(file);
         const files = Object.keys(zip.files);
 
-        files.forEach(path => {
+        const processNode = async (path: string, currentLevel: TreeNode[]) => {
           const parts = path.split('/');
-          let currentLevel = tree;
           let currentPath = '';
 
-          parts.forEach((part, index) => {
-            if (!part) return;
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            if (!part) continue;
 
             currentPath += (currentPath ? '/' : '') + part;
-            const isFile = index === parts.length - 1 && !path.endsWith('/');
+            const isFile = i === parts.length - 1 && !path.endsWith('/');
 
             let node = currentLevel.find(n => n.name === part);
             if (!node) {
@@ -78,56 +110,48 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
                 name: part,
                 type: isFile ? 'file' : 'folder',
                 path: currentPath,
-                ...(isFile ? {} : { children: [] })
+                ...(isFile ? {} : {
+                  children: [],
+                  fileStats: { empty: 0, nonEmpty: 0, total: 0 }
+                })
               };
+
+              if (isFile) {
+                const zipFile = zip.files[path];
+                const { isEmpty, size } = await calculateFileStats(zipFile);
+                node.size = size;
+
+                // Update parent folder stats
+                let parentPath = currentPath.split('/').slice(0, -1).join('/');
+                let parentNode = tree[0];
+                for (const parentPart of parentPath.split('/')) {
+                  if (!parentNode) break;
+                  if (parentNode.fileStats) {
+                    parentNode.fileStats.total++;
+                    if (isEmpty) {
+                      parentNode.fileStats.empty++;
+                    } else {
+                      parentNode.fileStats.nonEmpty++;
+                    }
+                  }
+                  parentNode = parentNode.children?.find(n => n.name === parentPart);
+                }
+              }
+
               currentLevel.push(node);
             }
 
             if (!isFile) {
               currentLevel = node.children!;
             }
-          });
-        });
+          }
+        };
 
-        addDebugLog(`Successfully built tree structure with ${files.length} entries`);
-      } else if (file.name.toLowerCase().endsWith('.tar')) {
-        addDebugLog('Processing TAR file structure');
-        const buffer = await file.arrayBuffer();
-        const tarReader = new Tar(new Uint8Array(buffer));
-
-        while (tarReader.hasNext()) {
-          const entry = tarReader.next();
-          if (!entry || !entry.name) continue;
-
-          const path = entry.name;
-          const parts = path.split('/');
-          let currentLevel = tree;
-          let currentPath = '';
-
-          parts.forEach((part, index) => {
-            if (!part) return;
-
-            currentPath += (currentPath ? '/' : '') + part;
-            const isFile = index === parts.length - 1;
-
-            let node = currentLevel.find(n => n.name === part);
-            if (!node) {
-              node = {
-                name: part,
-                type: isFile ? 'file' : 'folder',
-                path: currentPath,
-                ...(isFile ? {} : { children: [] })
-              };
-              currentLevel.push(node);
-            }
-
-            if (!isFile) {
-              currentLevel = node.children!;
-            }
-          });
+        for (const path of files) {
+          await processNode(path, tree);
         }
 
-        addDebugLog('Successfully processed TAR file structure');
+        addDebugLog(`Successfully built tree structure with ${files.length} entries`);
       }
 
       setFileTree(tree);
@@ -136,6 +160,11 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       addDebugLog(`Error building file tree: ${errorMessage}`);
       onError(`Failed to process file structure: ${errorMessage}`);
     }
+  };
+
+  const determineOperation = (link: string): 'insert' | 'update' => {
+    const lowerLink = link.toLowerCase();
+    return lowerLink.includes('update') || lowerLink.includes('modify') ? 'update' : 'insert';
   };
 
   const isValidArchive = (file: File): boolean => {
@@ -255,72 +284,50 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       }
 
       const processedZip = new JSZip();
+      const sourceZip = await JSZip.loadAsync(archiveFile);
 
-      if (isTarFile(archiveFile)) {
-        addDebugLog('Processing TAR file');
-        const tarBuffer = await archiveFile.arrayBuffer();
+      for (const folderConfig of config) {
+        if (!folderConfig || typeof folderConfig !== 'object') continue;
 
-        for (const folderConfig of config) {
-          if (!folderConfig || typeof folderConfig !== 'object') continue;
+        const folderName = folderConfig['Review Text'];
+        addDebugLog(`Processing folder: ${folderName}`);
 
-          const folderName = folderConfig['Review Text'];
-          addDebugLog(`Processing folder: ${folderName}`);
+        const folderStat: FolderStats = {
+          name: folderName,
+          fileCount: 0,
+          insertCount: 0,
+          updateCount: 0,
+          files: []
+        };
 
-          const folderStat: FolderStats = {
-            name: folderName,
-            fileCount: 0,
-            files: []
-          };
+        for (const link of folderConfig.Links || []) {
+          addDebugLog(`Processing file: ${link}`);
+          const file = findFileInZip(sourceZip, link);
+          if (file) {
+            folderStat.fileCount++;
+            const fileName = link.split('/').pop() || link;
+            const operation = determineOperation(link);
 
-          for (const link of folderConfig.Links || []) {
-            addDebugLog(`Processing file: ${link}`);
-            const fileContent = await findFileInTar(tarBuffer, link);
-            if (fileContent) {
-              folderStat.fileCount++;
-              const fileName = link.split('/').pop() || link;
-              folderStat.files.push(fileName);
-              processedZip.folder(folderName)?.file(fileName, fileContent);
-              addDebugLog(`Successfully processed file: ${fileName}`);
+            if (operation === 'insert') {
+              folderStat.insertCount++;
             } else {
-              addDebugLog(`Warning: File not found: ${link}`);
+              folderStat.updateCount++;
             }
+
+            folderStat.files.push({
+              name: fileName,
+              operation
+            });
+
+            const content = await file.async('uint8array');
+            processedZip.folder(folderName)?.file(fileName, content);
+            addDebugLog(`Successfully processed file: ${fileName} (${operation})`);
+          } else {
+            addDebugLog(`Warning: File not found: ${link}`);
           }
-
-          newFolderStats.push(folderStat);
         }
-      } else {
-        addDebugLog('Processing ZIP file');
-        const sourceZip = await JSZip.loadAsync(archiveFile);
 
-        for (const folderConfig of config) {
-          if (!folderConfig || typeof folderConfig !== 'object') continue;
-
-          const folderName = folderConfig['Review Text'];
-          addDebugLog(`Processing folder: ${folderName}`);
-
-          const folderStat: FolderStats = {
-            name: folderName,
-            fileCount: 0,
-            files: []
-          };
-
-          for (const link of folderConfig.Links || []) {
-            addDebugLog(`Processing file: ${link}`);
-            const file = findFileInZip(sourceZip, link);
-            if (file) {
-              folderStat.fileCount++;
-              const fileName = link.split('/').pop() || link;
-              folderStat.files.push(fileName);
-              const content = await file.async('uint8array');
-              processedZip.folder(folderName)?.file(fileName, content);
-              addDebugLog(`Successfully processed file: ${fileName}`);
-            } else {
-              addDebugLog(`Warning: File not found: ${link}`);
-            }
-          }
-
-          newFolderStats.push(folderStat);
-        }
+        newFolderStats.push(folderStat);
       }
 
       setFolderStats(newFolderStats);
@@ -375,20 +382,106 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
                             <ChevronRight className="w-4 h-4 text-gray-500" />
                         )}
                         <Folder className="w-4 h-4 text-blue-500" />
+                        <span className="text-sm text-gray-700">{node.name}</span>
+                        {node.fileStats && (
+                            <span className="text-xs text-gray-500">
+                      ({node.fileStats.total} files: {node.fileStats.nonEmpty} non-empty, {node.fileStats.empty} empty)
+                    </span>
+                        )}
                       </>
                   ) : (
                       <>
                         <span className="w-4" />
                         <File className="w-4 h-4 text-gray-400" />
+                        <span className="text-sm text-gray-700">{node.name}</span>
+                        {node.size !== undefined && (
+                            <span className="text-xs text-gray-500">
+                      ({node.size === 0 ? 'empty' : `${node.size} bytes`})
+                    </span>
+                        )}
                       </>
                   )}
-                  <span className="text-sm text-gray-700">{node.name}</span>
                 </div>
                 {node.type === 'folder' && expandedNodes.has(node.path) && node.children && (
                     <TreeView nodes={node.children} level={level + 1} />
                 )}
               </div>
           ))}
+        </div>
+    );
+  };
+
+  const OutputTreeView: React.FC<{
+    folders: FolderStats[]
+  }> = ({ folders }) => {
+    const totalFiles = folders.reduce((sum, folder) => sum + folder.fileCount, 0);
+    const totalInserts = folders.reduce((sum, folder) => sum + folder.insertCount, 0);
+    const totalUpdates = folders.reduce((sum, folder) => sum + folder.updateCount, 0);
+
+    return (
+        <div className="border border-gray-100 rounded-lg p-4">
+          <div className="space-y-2">
+            <div className="border border-gray-100 rounded-lg">
+              <div
+                  className="flex items-center gap-2 cursor-pointer p-4"
+                  onClick={() => toggleOutputFolder('processed_files')}
+              >
+                {expandedOutputFolders.has('processed_files') ? (
+                    <ChevronDown className="w-4 h-4 text-gray-500" />
+                ) : (
+                    <ChevronRight className="w-4 h-4 text-gray-500" />
+                )}
+                <Folder className="w-5 h-5 text-blue-500" />
+                <span className="font-medium text-gray-800">Processed Files</span>
+                <span className="text-sm text-gray-500">
+                ({totalFiles} files: {totalInserts} inserts, {totalUpdates} updates)
+              </span>
+              </div>
+
+              {expandedOutputFolders.has('processed_files') && (
+                  <div className="border-t border-gray-100">
+                    {folders.map((folder, index) => (
+                        <div key={index} className="border-b border-gray-100 last:border-b-0">
+                          <div className="p-4 pl-8">
+                            <div
+                                className="flex items-center gap-2 cursor-pointer"
+                                onClick={() => toggleOutputFolder(folder.name)}
+                            >
+                              {expandedOutputFolders.has(folder.name) ? (
+                                  <ChevronDown className="w-4 h-4 text-gray-500" />
+                              ) : (
+                                  <ChevronRight className="w-4 h-4 text-gray-500" />
+                              )}
+                              <Folder className="w-5 h-5 text-blue-500" />
+                              <span className="font-medium text-gray-800">{folder.name}</span>
+                              <span className="text-sm text-gray-500">
+                          ({folder.fileCount} files: {folder.insertCount} inserts, {folder.updateCount} updates)
+                        </span>
+                            </div>
+                            {expandedOutputFolders.has(folder.name) && (
+                                <div className="ml-6 mt-2 space-y-1">
+                                  {folder.files.map((file, fileIndex) => (
+                                      <div key={fileIndex} className="flex items-center gap-2 text-sm text-gray-600 py-1">
+                                        <File className="w-4 h-4 text-gray-400" />
+                                        <span>{file.name}</span>
+                                        <span className={`text-xs px-2 py-0.5 rounded ${
+                                            file.operation === 'insert'
+                                                ? 'bg-green-100 text-green-700'
+                                                : 'bg-blue-100 text-blue-700'
+                                        }`}>
+                                {file.operation}
+                              </span>
+                                      </div>
+                                  ))}
+                                </div>
+                            )}
+                          </div>
+                        </div>
+                    ))}
+                  </div>
+              )}
+            </div>
+          </div>
         </div>
     );
   };
@@ -527,25 +620,9 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
                     <div className="space-y-4">
                       <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
                         <Layers className="w-5 h-5 text-blue-500" />
-                        Processed Structure
+                        Output Structure
                       </h3>
-                      {folderStats.map((folder, index) => (
-                          <div key={index} className="border border-gray-100 rounded-lg p-4">
-                            <div className="flex items-center gap-2 mb-2">
-                              <Folder className="w-5 h-5 text-blue-500" />
-                              <span className="font-medium text-gray-800">{folder.name}</span>
-                              <span className="text-sm text-gray-500">({folder.fileCount} files)</span>
-                            </div>
-                            <div className="ml-6 space-y-1">
-                              {folder.files.map((file, fileIndex) => (
-                                  <div key={fileIndex} className="flex items-center gap-2 text-sm text-gray-600">
-                                    <File className="w-4 h-4 text-gray-400" />
-                                    {file}
-                                  </div>
-                              ))}
-                            </div>
-                          </div>
-                      ))}
+                      <OutputTreeView folders={folderStats} />
                     </div>
                 )}
 
