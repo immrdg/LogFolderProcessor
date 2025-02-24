@@ -89,6 +89,8 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
     while (tarReader.hasNext()) {
       const entry = tarReader.next();
+      if (!entry || !entry.name) continue;
+
       const entryPath = normalizeFilePath(entry.name);
 
       if (entryPath === normalizedSearchPath ||
@@ -115,6 +117,10 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       const jsonContent = await jsonFile.text();
       const config = JSON.parse(jsonContent);
 
+      if (!Array.isArray(config)) {
+        throw new Error('Invalid JSON format: expected an array');
+      }
+
       setDebug(prev => [...prev, 'JSON config loaded successfully']);
 
       const processedZip = new JSZip();
@@ -126,14 +132,35 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
         // Process each folder configuration
         for (const folderConfig of config) {
-          const folderName = folderConfig['Review Test'].replace(/[^a-zA-Z0-9-_]/g, '_');
-          const links = folderConfig.Links;
+          if (!folderConfig || typeof folderConfig !== 'object') {
+            setDebug(prev => [...prev, 'Skipping invalid folder configuration']);
+            continue;
+          }
+
+          const reviewTest = folderConfig['Review Test'];
+          if (!reviewTest || typeof reviewTest !== 'string') {
+            setDebug(prev => [...prev, 'Skipping folder with invalid Review Test name']);
+            continue;
+          }
+
+          const folderName = reviewTest.replace(/[^a-zA-Z0-9-_]/g, '_');
+          const links = Array.isArray(folderConfig.Links) ? folderConfig.Links : [];
+
+          if (links.length === 0) {
+            setDebug(prev => [...prev, `No links found for folder: ${folderName}`]);
+            continue;
+          }
 
           setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
           setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
 
           // Process all files for this folder
           for (const link of links) {
+            if (!link || typeof link !== 'string') {
+              setDebug(prev => [...prev, 'Skipping invalid link']);
+              continue;
+            }
+
             const normalizedLink = normalizeFilePath(link);
             const fileContent = await findFileInTar(tarBuffer, normalizedLink);
 
@@ -161,14 +188,35 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
         // Process each folder configuration
         for (const folderConfig of config) {
-          const folderName = folderConfig['Review Test'].replace(/[^a-zA-Z0-9-_]/g, '_');
-          const links = folderConfig.Links;
+          if (!folderConfig || typeof folderConfig !== 'object') {
+            setDebug(prev => [...prev, 'Skipping invalid folder configuration']);
+            continue;
+          }
+
+          const reviewTest = folderConfig['Review Test'];
+          if (!reviewTest || typeof reviewTest !== 'string') {
+            setDebug(prev => [...prev, 'Skipping folder with invalid Review Test name']);
+            continue;
+          }
+
+          const folderName = reviewTest.replace(/[^a-zA-Z0-9-_]/g, '_');
+          const links = Array.isArray(folderConfig.Links) ? folderConfig.Links : [];
+
+          if (links.length === 0) {
+            setDebug(prev => [...prev, `No links found for folder: ${folderName}`]);
+            continue;
+          }
 
           setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
           setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
 
           // Process all files for this folder
           for (const link of links) {
+            if (!link || typeof link !== 'string') {
+              setDebug(prev => [...prev, 'Skipping invalid link']);
+              continue;
+            }
+
             const normalizedLink = normalizeFilePath(link);
             const file = findFileInZip(sourceZip, normalizedLink);
 
