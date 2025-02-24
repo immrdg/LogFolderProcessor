@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from 'react';
 import { Upload, FileJson, FolderTree, Download } from 'lucide-react';
 import JSZip from 'jszip';
+import Tar from 'tar-js';
 import { ProcessingStatus } from '../types';
 
 interface FileProcessorProps {
@@ -9,29 +10,36 @@ interface FileProcessorProps {
 }
 
 const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }) => {
-  const [zipFile, setZipFile] = useState<File | null>(null);
+  const [archiveFile, setArchiveFile] = useState<File | null>(null);
   const [jsonFile, setJsonFile] = useState<File | null>(null);
   const [processedZip, setProcessedZip] = useState<Blob | null>(null);
   const [debug, setDebug] = useState<string[]>([]);
 
-  const isZipFile = (file: File): boolean => {
+  const isValidArchive = (file: File): boolean => {
     // Check both MIME type and file extension
+    const fileName = file.name.toLowerCase();
     return (
         file.type === 'application/zip' ||
         file.type === 'application/x-zip-compressed' ||
-        file.name.toLowerCase().endsWith('.zip')
+        file.type === 'application/x-tar' ||
+        fileName.endsWith('.zip') ||
+        fileName.endsWith('.tar')
     );
   };
 
-  const handleZipChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const isTarFile = (file: File): boolean => {
+    return file.name.toLowerCase().endsWith('.tar') || file.type === 'application/x-tar';
+  };
+
+  const handleArchiveChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file && isZipFile(file)) {
-      setZipFile(file);
+    if (file && isValidArchive(file)) {
+      setArchiveFile(file);
       setProcessedZip(null);
       setDebug([]);
       onError(null);
     } else {
-      onError('Please select a valid ZIP file');
+      onError('Please select a valid ZIP or TAR file');
     }
   };
 
@@ -75,9 +83,27 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     return matchingFile ? zip.file(matchingFile) : null;
   };
 
+  const findFileInTar = async (tar: ArrayBuffer, searchPath: string): Promise<Uint8Array | null> => {
+    const tarReader = new Tar(new Uint8Array(tar));
+    const normalizedSearchPath = normalizeFilePath(searchPath);
+
+    while (tarReader.hasNext()) {
+      const entry = tarReader.next();
+      const entryPath = normalizeFilePath(entry.name);
+
+      if (entryPath === normalizedSearchPath ||
+          entryPath === `MainTestFolder/${normalizedSearchPath}` ||
+          (normalizedSearchPath.startsWith('MainTestFolder/') &&
+              entryPath === normalizedSearchPath.replace('MainTestFolder/', ''))) {
+        return entry.buffer;
+      }
+    }
+    return null;
+  };
+
   const processFiles = async () => {
-    if (!zipFile || !jsonFile) {
-      onError('Please upload both ZIP and JSON files');
+    if (!archiveFile || !jsonFile) {
+      onError('Please upload both archive and JSON files');
       return;
     }
 
@@ -91,41 +117,76 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
       setDebug(prev => [...prev, 'JSON config loaded successfully']);
 
-      // Read the ZIP file
-      const sourceZip = await JSZip.loadAsync(zipFile);
       const processedZip = new JSZip();
 
-      // Log available files for debugging
-      const availableFiles = Object.keys(sourceZip.files).map(normalizeFilePath);
-      setDebug(prev => [...prev, `ZIP file loaded. Available files: ${availableFiles.join(', ')}`]);
+      if (isTarFile(archiveFile)) {
+        // Handle TAR file
+        const tarBuffer = await archiveFile.arrayBuffer();
+        setDebug(prev => [...prev, 'TAR file loaded successfully']);
 
-      // Process each folder configuration
-      for (const folderConfig of config) {
-        const folderName = folderConfig['Review Test'].replace(/[^a-zA-Z0-9-_]/g, '_');
-        const links = folderConfig.Links;
+        // Process each folder configuration
+        for (const folderConfig of config) {
+          const folderName = folderConfig['Review Test'].replace(/[^a-zA-Z0-9-_]/g, '_');
+          const links = folderConfig.Links;
 
-        setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
-        setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
+          setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
+          setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
 
-        // Process all files for this folder
-        for (const link of links) {
-          const normalizedLink = normalizeFilePath(link);
-          const file = findFileInZip(sourceZip, normalizedLink);
+          // Process all files for this folder
+          for (const link of links) {
+            const normalizedLink = normalizeFilePath(link);
+            const fileContent = await findFileInTar(tarBuffer, normalizedLink);
 
-          if (file) {
-            setDebug(prev => [...prev, `Found file: ${file.name}`]);
-            try {
-              const content = await file.async('uint8array');
-              const fileName = normalizedLink.split('/').pop();
-              if (fileName) {
-                processedZip.folder(folderName)?.file(fileName, content);
-                setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
+            if (fileContent) {
+              setDebug(prev => [...prev, `Found file: ${normalizedLink}`]);
+              try {
+                const fileName = normalizedLink.split('/').pop();
+                if (fileName) {
+                  processedZip.folder(folderName)?.file(fileName, fileContent);
+                  setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
+                }
+              } catch (err) {
+                setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
               }
-            } catch (err) {
-              setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
+            } else {
+              setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
             }
-          } else {
-            setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
+          }
+        }
+      } else {
+        // Handle ZIP file
+        const sourceZip = await JSZip.loadAsync(archiveFile);
+        const availableFiles = Object.keys(sourceZip.files).map(normalizeFilePath);
+        setDebug(prev => [...prev, `ZIP file loaded. Available files: ${availableFiles.join(', ')}`]);
+
+        // Process each folder configuration
+        for (const folderConfig of config) {
+          const folderName = folderConfig['Review Test'].replace(/[^a-zA-Z0-9-_]/g, '_');
+          const links = folderConfig.Links;
+
+          setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
+          setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
+
+          // Process all files for this folder
+          for (const link of links) {
+            const normalizedLink = normalizeFilePath(link);
+            const file = findFileInZip(sourceZip, normalizedLink);
+
+            if (file) {
+              setDebug(prev => [...prev, `Found file: ${file.name}`]);
+              try {
+                const content = await file.async('uint8array');
+                const fileName = normalizedLink.split('/').pop();
+                if (fileName) {
+                  processedZip.folder(folderName)?.file(fileName, content);
+                  setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
+                }
+              } catch (err) {
+                setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
+              }
+            } else {
+              setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
+            }
           }
         }
       }
@@ -164,21 +225,21 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
             <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors">
               <input
                   type="file"
-                  accept=".zip"
-                  onChange={handleZipChange}
+                  accept=".zip,.tar"
+                  onChange={handleArchiveChange}
                   className="hidden"
-                  id="zipInput"
+                  id="archiveInput"
               />
               <label
-                  htmlFor="zipInput"
+                  htmlFor="archiveInput"
                   className="cursor-pointer block"
               >
                 <Upload className="w-8 h-8 text-gray-400 mx-auto mb-4" />
                 <span className="block text-sm font-medium text-gray-700 mb-1">
-                Upload ZIP File
+                Upload ZIP or TAR File
               </span>
                 <span className="text-xs text-gray-500">
-                {zipFile ? zipFile.name : 'Click to browse'}
+                {archiveFile ? archiveFile.name : 'Click to browse'}
               </span>
               </label>
             </div>
@@ -212,9 +273,9 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
         <div className="flex gap-4">
           <button
               onClick={processFiles}
-              disabled={!zipFile || !jsonFile}
+              disabled={!archiveFile || !jsonFile}
               className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
-            ${zipFile && jsonFile
+            ${archiveFile && jsonFile
                   ? 'bg-blue-500 hover:bg-blue-600'
                   : 'bg-gray-300 cursor-not-allowed'
               }`}
