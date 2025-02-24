@@ -1,5 +1,5 @@
-import React, { useCallback, useState } from 'react';
-import { Upload, FileJson, FolderTree, Download } from 'lucide-react';
+import React, { useState } from 'react';
+import { Upload, FileJson, FolderTree, Download, File, Folder } from 'lucide-react';
 import JSZip from 'jszip';
 import Tar from 'tar-js';
 import { ProcessingStatus } from '../types';
@@ -9,14 +9,21 @@ interface FileProcessorProps {
   onError: (error: string | null) => void;
 }
 
+interface FolderStats {
+  name: string;
+  fileCount: number;
+  files: string[];
+}
+
 const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }) => {
   const [archiveFile, setArchiveFile] = useState<File | null>(null);
   const [jsonFile, setJsonFile] = useState<File | null>(null);
   const [processedZip, setProcessedZip] = useState<Blob | null>(null);
   const [debug, setDebug] = useState<string[]>([]);
+  const [batchId, setBatchId] = useState<string>('');
+  const [folderStats, setFolderStats] = useState<FolderStats[]>([]);
 
   const isValidArchive = (file: File): boolean => {
-    // Check both MIME type and file extension
     const fileName = file.name.toLowerCase();
     return (
         file.type === 'application/zip' ||
@@ -56,30 +63,33 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   };
 
   const normalizeFilePath = (path: string): string => {
-    // Convert Windows backslashes to forward slashes and ensure proper path format
     return path.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
   };
 
   const findFileInZip = (zip: JSZip, searchPath: string): JSZip.JSZipObject | null => {
     const normalizedSearchPath = normalizeFilePath(searchPath);
 
-    // Try direct path
+    // First try direct match
     let file = zip.file(normalizedSearchPath);
     if (file) return file;
 
-    // Try with MainTestFolder prefix
-    file = zip.file(`MainTestFolder/${normalizedSearchPath}`);
-    if (file) return file;
-
-    // Try without MainTestFolder prefix if it exists in the path
-    if (normalizedSearchPath.startsWith('MainTestFolder/')) {
-      file = zip.file(normalizedSearchPath.replace('MainTestFolder/', ''));
-      if (file) return file;
-    }
-
-    // Search through all files in the ZIP
+    // Get all files in the ZIP
     const allFiles = Object.keys(zip.files).map(normalizeFilePath);
-    const matchingFile = allFiles.find(f => f.endsWith(normalizedSearchPath));
+
+    // Try to find the file by matching the end of the path
+    const matchingFile = allFiles.find(f => {
+      const parts = f.split('/');
+      const searchParts = normalizedSearchPath.split('/');
+
+      // Match from the end of the path
+      for (let i = 1; i <= searchParts.length; i++) {
+        if (parts[parts.length - i] !== searchParts[searchParts.length - i]) {
+          return false;
+        }
+      }
+      return true;
+    });
+
     return matchingFile ? zip.file(matchingFile) : null;
   };
 
@@ -92,11 +102,19 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       if (!entry || !entry.name) continue;
 
       const entryPath = normalizeFilePath(entry.name);
+      const searchParts = normalizedSearchPath.split('/');
+      const entryParts = entryPath.split('/');
 
-      if (entryPath === normalizedSearchPath ||
-          entryPath === `MainTestFolder/${normalizedSearchPath}` ||
-          (normalizedSearchPath.startsWith('MainTestFolder/') &&
-              entryPath === normalizedSearchPath.replace('MainTestFolder/', ''))) {
+      // Match from the end of the path
+      let matches = true;
+      for (let i = 1; i <= searchParts.length; i++) {
+        if (entryParts[entryParts.length - i] !== searchParts[searchParts.length - i]) {
+          matches = false;
+          break;
+        }
+      }
+
+      if (matches) {
         return entry.buffer;
       }
     }
@@ -112,6 +130,7 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     try {
       onStatusChange('processing');
       setDebug([]);
+      const newFolderStats: FolderStats[] = [];
 
       // Read the JSON file
       const jsonContent = await jsonFile.text();
@@ -130,120 +149,60 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
         const tarBuffer = await archiveFile.arrayBuffer();
         setDebug(prev => [...prev, 'TAR file loaded successfully']);
 
-        // Process each folder configuration
         for (const folderConfig of config) {
-          if (!folderConfig || typeof folderConfig !== 'object') {
-            setDebug(prev => [...prev, 'Skipping invalid folder configuration']);
-            continue;
-          }
+          if (!folderConfig || typeof folderConfig !== 'object') continue;
 
-          const reviewTest = folderConfig['Review Test'];
-          if (!reviewTest || typeof reviewTest !== 'string') {
-            setDebug(prev => [...prev, 'Skipping folder with invalid Review Test name']);
-            continue;
-          }
+          const folderName = folderConfig['Review Test'];
+          const folderStat: FolderStats = {
+            name: folderName,
+            fileCount: 0,
+            files: []
+          };
 
-          const folderName = reviewTest.replace(/[^a-zA-Z0-9-_]/g, '_');
-          const links = Array.isArray(folderConfig.Links) ? folderConfig.Links : [];
-
-          if (links.length === 0) {
-            setDebug(prev => [...prev, `No links found for folder: ${folderName}`]);
-            continue;
-          }
-
-          setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
-          setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
-
-          // Process all files for this folder
-          for (const link of links) {
-            if (!link || typeof link !== 'string') {
-              setDebug(prev => [...prev, 'Skipping invalid link']);
-              continue;
-            }
-
-            const normalizedLink = normalizeFilePath(link);
-            const fileContent = await findFileInTar(tarBuffer, normalizedLink);
-
+          for (const link of folderConfig.Links || []) {
+            const fileContent = await findFileInTar(tarBuffer, link);
             if (fileContent) {
-              setDebug(prev => [...prev, `Found file: ${normalizedLink}`]);
-              try {
-                const fileName = normalizedLink.split('/').pop();
-                if (fileName) {
-                  processedZip.folder(folderName)?.file(fileName, fileContent);
-                  setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
-                }
-              } catch (err) {
-                setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
-              }
-            } else {
-              setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
+              folderStat.fileCount++;
+              const fileName = link.split('/').pop() || link;
+              folderStat.files.push(fileName);
+              processedZip.folder(folderName)?.file(fileName, fileContent);
             }
           }
+
+          newFolderStats.push(folderStat);
         }
       } else {
-        // Handle ZIP file
         const sourceZip = await JSZip.loadAsync(archiveFile);
-        const availableFiles = Object.keys(sourceZip.files).map(normalizeFilePath);
-        setDebug(prev => [...prev, `ZIP file loaded. Available files: ${availableFiles.join(', ')}`]);
 
-        // Process each folder configuration
         for (const folderConfig of config) {
-          if (!folderConfig || typeof folderConfig !== 'object') {
-            setDebug(prev => [...prev, 'Skipping invalid folder configuration']);
-            continue;
-          }
+          if (!folderConfig || typeof folderConfig !== 'object') continue;
 
-          const reviewTest = folderConfig['Review Test'];
-          if (!reviewTest || typeof reviewTest !== 'string') {
-            setDebug(prev => [...prev, 'Skipping folder with invalid Review Test name']);
-            continue;
-          }
+          const folderName = folderConfig['Review Test'];
+          const folderStat: FolderStats = {
+            name: folderName,
+            fileCount: 0,
+            files: []
+          };
 
-          const folderName = reviewTest.replace(/[^a-zA-Z0-9-_]/g, '_');
-          const links = Array.isArray(folderConfig.Links) ? folderConfig.Links : [];
-
-          if (links.length === 0) {
-            setDebug(prev => [...prev, `No links found for folder: ${folderName}`]);
-            continue;
-          }
-
-          setDebug(prev => [...prev, `Processing folder: ${folderName}`]);
-          setDebug(prev => [...prev, `Looking for files: ${links.join(', ')}`]);
-
-          // Process all files for this folder
-          for (const link of links) {
-            if (!link || typeof link !== 'string') {
-              setDebug(prev => [...prev, 'Skipping invalid link']);
-              continue;
-            }
-
-            const normalizedLink = normalizeFilePath(link);
-            const file = findFileInZip(sourceZip, normalizedLink);
-
+          for (const link of folderConfig.Links || []) {
+            const file = findFileInZip(sourceZip, link);
             if (file) {
-              setDebug(prev => [...prev, `Found file: ${file.name}`]);
-              try {
-                const content = await file.async('uint8array');
-                const fileName = normalizedLink.split('/').pop();
-                if (fileName) {
-                  processedZip.folder(folderName)?.file(fileName, content);
-                  setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
-                }
-              } catch (err) {
-                setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
-              }
-            } else {
-              setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
+              folderStat.fileCount++;
+              const fileName = link.split('/').pop() || link;
+              folderStat.files.push(fileName);
+              const content = await file.async('uint8array');
+              processedZip.folder(folderName)?.file(fileName, content);
             }
           }
+
+          newFolderStats.push(folderStat);
         }
       }
 
-      // Generate the processed ZIP file
+      setFolderStats(newFolderStats);
       const processedBlob = await processedZip.generateAsync({ type: 'blob' });
       setProcessedZip(processedBlob);
       onStatusChange('success');
-      setDebug(prev => [...prev, 'ZIP file generated successfully']);
     } catch (error) {
       console.error('Processing error:', error);
       const errorMessage = error instanceof Error ? error.message : 'An error occurred while processing the files';
@@ -254,15 +213,17 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   };
 
   const handleDownload = () => {
-    if (processedZip) {
+    if (processedZip && batchId.trim()) {
       const url = URL.createObjectURL(processedZip);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'processed_files.zip';
+      a.download = `processed_files_${batchId.trim()}.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+    } else {
+      onError('Please enter a Batch ID before downloading');
     }
   };
 
@@ -318,30 +279,83 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
           </div>
         </div>
 
-        <div className="flex gap-4">
-          <button
-              onClick={processFiles}
-              disabled={!archiveFile || !jsonFile}
-              className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
-            ${archiveFile && jsonFile
-                  ? 'bg-blue-500 hover:bg-blue-600'
-                  : 'bg-gray-300 cursor-not-allowed'
-              }`}
-          >
-            <FolderTree className="w-5 h-5" />
-            Process Files
-          </button>
-
+        <div className="flex flex-col gap-4">
           {processedZip && (
-              <button
-                  onClick={handleDownload}
-                  className="flex-1 py-3 px-4 rounded-lg text-white font-medium bg-green-500 hover:bg-green-600 flex items-center justify-center gap-2"
-              >
-                <Download className="w-5 h-5" />
-                Download Processed Files
-              </button>
+              <div className="bg-white rounded-lg shadow-md p-6">
+                <div className="mb-4">
+                  <label htmlFor="batchId" className="block text-sm font-medium text-gray-700 mb-2">
+                    Enter Batch ID
+                  </label>
+                  <input
+                      type="text"
+                      id="batchId"
+                      value={batchId}
+                      onChange={(e) => setBatchId(e.target.value)}
+                      placeholder="Enter batch ID for download"
+                      className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                </div>
+              </div>
           )}
+
+          <div className="flex gap-4">
+            <button
+                onClick={processFiles}
+                disabled={!archiveFile || !jsonFile}
+                className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
+              ${archiveFile && jsonFile
+                    ? 'bg-blue-500 hover:bg-blue-600'
+                    : 'bg-gray-300 cursor-not-allowed'
+                }`}
+            >
+              <FolderTree className="w-5 h-5" />
+              Process Files
+            </button>
+
+            {processedZip && (
+                <button
+                    onClick={handleDownload}
+                    disabled={!batchId.trim()}
+                    className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
+                ${batchId.trim()
+                        ? 'bg-green-500 hover:bg-green-600'
+                        : 'bg-gray-300 cursor-not-allowed'
+                    }`}
+                >
+                  <Download className="w-5 h-5" />
+                  Download Processed Files
+                </button>
+            )}
+          </div>
         </div>
+
+        {folderStats.length > 0 && (
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                <FolderTree className="w-5 h-5 text-blue-500" />
+                File Structure
+              </h3>
+              <div className="space-y-4">
+                {folderStats.map((folder, index) => (
+                    <div key={index} className="border border-gray-100 rounded-lg p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Folder className="w-5 h-5 text-blue-500" />
+                        <span className="font-medium text-gray-800">{folder.name}</span>
+                        <span className="text-sm text-gray-500">({folder.fileCount} files)</span>
+                      </div>
+                      <div className="ml-6 space-y-1">
+                        {folder.files.map((file, fileIndex) => (
+                            <div key={fileIndex} className="flex items-center gap-2 text-sm text-gray-600">
+                              <File className="w-4 h-4 text-gray-400" />
+                              {file}
+                            </div>
+                        ))}
+                      </div>
+                    </div>
+                ))}
+              </div>
+            </div>
+        )}
 
         {debug.length > 0 && (
             <div className="mt-6 p-4 bg-gray-50 rounded-lg">
