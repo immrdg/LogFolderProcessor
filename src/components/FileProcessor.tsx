@@ -38,6 +38,34 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     }
   };
 
+  const normalizeFilePath = (path: string): string => {
+    // Convert Windows backslashes to forward slashes and ensure proper path format
+    return path.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+  };
+
+  const findFileInZip = (zip: JSZip, searchPath: string): JSZip.JSZipObject | null => {
+    const normalizedSearchPath = normalizeFilePath(searchPath);
+
+    // Try direct path
+    let file = zip.file(normalizedSearchPath);
+    if (file) return file;
+
+    // Try with MainTestFolder prefix
+    file = zip.file(`MainTestFolder/${normalizedSearchPath}`);
+    if (file) return file;
+
+    // Try without MainTestFolder prefix if it exists in the path
+    if (normalizedSearchPath.startsWith('MainTestFolder/')) {
+      file = zip.file(normalizedSearchPath.replace('MainTestFolder/', ''));
+      if (file) return file;
+    }
+
+    // Search through all files in the ZIP
+    const allFiles = Object.keys(zip.files).map(normalizeFilePath);
+    const matchingFile = allFiles.find(f => f.endsWith(normalizedSearchPath));
+    return matchingFile ? zip.file(matchingFile) : null;
+  };
+
   const processFiles = async () => {
     if (!zipFile || !jsonFile) {
       onError('Please upload both ZIP and JSON files');
@@ -59,7 +87,7 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       const processedZip = new JSZip();
 
       // Log available files for debugging
-      const availableFiles = Object.keys(sourceZip.files);
+      const availableFiles = Object.keys(sourceZip.files).map(normalizeFilePath);
       setDebug(prev => [...prev, `ZIP file loaded. Available files: ${availableFiles.join(', ')}`]);
 
       // Process each folder configuration
@@ -72,24 +100,23 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
         // Process all files for this folder
         for (const link of links) {
-          // Add the MainTestFolder prefix to the path
-          const fullPath = `MainTestFolder/${link}`;
-          const file = sourceZip.file(fullPath);
+          const normalizedLink = normalizeFilePath(link);
+          const file = findFileInZip(sourceZip, normalizedLink);
 
           if (file) {
             setDebug(prev => [...prev, `Found file: ${file.name}`]);
             try {
               const content = await file.async('uint8array');
-              const fileName = link.split('/').pop();
+              const fileName = normalizedLink.split('/').pop();
               if (fileName) {
                 processedZip.folder(folderName)?.file(fileName, content);
                 setDebug(prev => [...prev, `Successfully processed: ${fileName} into ${folderName}`]);
               }
             } catch (err) {
-              setDebug(prev => [...prev, `Error processing file ${link}: ${err}`]);
+              setDebug(prev => [...prev, `Error processing file ${normalizedLink}: ${err}`]);
             }
           } else {
-            setDebug(prev => [...prev, `File not found: ${fullPath}`]);
+            setDebug(prev => [...prev, `File not found: ${normalizedLink}`]);
           }
         }
       }
