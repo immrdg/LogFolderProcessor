@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Upload, FileJson, FolderTree, Download, File, Folder } from 'lucide-react';
+import { Upload, FileJson, FolderTree, Download, File, Folder, Layers, Terminal, ChevronRight, ChevronDown } from 'lucide-react';
 import JSZip from 'jszip';
 import Tar from 'tar-js';
 import { ProcessingStatus } from '../types';
@@ -15,6 +15,15 @@ interface FolderStats {
   files: string[];
 }
 
+interface TreeNode {
+  name: string;
+  type: 'file' | 'folder';
+  children?: TreeNode[];
+  path: string;
+}
+
+type TabType = 'input' | 'output' | 'logs';
+
 const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }) => {
   const [archiveFile, setArchiveFile] = useState<File | null>(null);
   const [jsonFile, setJsonFile] = useState<File | null>(null);
@@ -22,6 +31,112 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   const [debug, setDebug] = useState<string[]>([]);
   const [batchId, setBatchId] = useState<string>('');
   const [folderStats, setFolderStats] = useState<FolderStats[]>([]);
+  const [activeTab, setActiveTab] = useState<TabType>('input');
+  const [showBatchIdModal, setShowBatchIdModal] = useState(false);
+  const [fileTree, setFileTree] = useState<TreeNode[]>([]);
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
+
+  const addDebugLog = (message: string) => {
+    setDebug(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
+  };
+
+  const toggleNode = (path: string) => {
+    setExpandedNodes(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  const buildFileTree = async (file: File) => {
+    addDebugLog(`Building file tree for ${file.name}`);
+    const tree: TreeNode[] = [];
+
+    try {
+      if (file.name.toLowerCase().endsWith('.zip')) {
+        const zip = await JSZip.loadAsync(file);
+        const files = Object.keys(zip.files);
+
+        files.forEach(path => {
+          const parts = path.split('/');
+          let currentLevel = tree;
+          let currentPath = '';
+
+          parts.forEach((part, index) => {
+            if (!part) return;
+
+            currentPath += (currentPath ? '/' : '') + part;
+            const isFile = index === parts.length - 1 && !path.endsWith('/');
+
+            let node = currentLevel.find(n => n.name === part);
+            if (!node) {
+              node = {
+                name: part,
+                type: isFile ? 'file' : 'folder',
+                path: currentPath,
+                ...(isFile ? {} : { children: [] })
+              };
+              currentLevel.push(node);
+            }
+
+            if (!isFile) {
+              currentLevel = node.children!;
+            }
+          });
+        });
+
+        addDebugLog(`Successfully built tree structure with ${files.length} entries`);
+      } else if (file.name.toLowerCase().endsWith('.tar')) {
+        addDebugLog('Processing TAR file structure');
+        const buffer = await file.arrayBuffer();
+        const tarReader = new Tar(new Uint8Array(buffer));
+
+        while (tarReader.hasNext()) {
+          const entry = tarReader.next();
+          if (!entry || !entry.name) continue;
+
+          const path = entry.name;
+          const parts = path.split('/');
+          let currentLevel = tree;
+          let currentPath = '';
+
+          parts.forEach((part, index) => {
+            if (!part) return;
+
+            currentPath += (currentPath ? '/' : '') + part;
+            const isFile = index === parts.length - 1;
+
+            let node = currentLevel.find(n => n.name === part);
+            if (!node) {
+              node = {
+                name: part,
+                type: isFile ? 'file' : 'folder',
+                path: currentPath,
+                ...(isFile ? {} : { children: [] })
+              };
+              currentLevel.push(node);
+            }
+
+            if (!isFile) {
+              currentLevel = node.children!;
+            }
+          });
+        }
+
+        addDebugLog('Successfully processed TAR file structure');
+      }
+
+      setFileTree(tree);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      addDebugLog(`Error building file tree: ${errorMessage}`);
+      onError(`Failed to process file structure: ${errorMessage}`);
+    }
+  };
 
   const isValidArchive = (file: File): boolean => {
     const fileName = file.name.toLowerCase();
@@ -38,15 +153,19 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     return file.name.toLowerCase().endsWith('.tar') || file.type === 'application/x-tar';
   };
 
-  const handleArchiveChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleArchiveChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file && isValidArchive(file)) {
       setArchiveFile(file);
       setProcessedZip(null);
       setDebug([]);
+      setFileTree([]);
       onError(null);
+      addDebugLog(`Selected archive file: ${file.name}`);
+      await buildFileTree(file);
     } else {
       onError('Please select a valid ZIP or TAR file');
+      addDebugLog('Invalid archive file selected');
     }
   };
 
@@ -69,19 +188,15 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   const findFileInZip = (zip: JSZip, searchPath: string): JSZip.JSZipObject | null => {
     const normalizedSearchPath = normalizeFilePath(searchPath);
 
-    // First try direct match
     let file = zip.file(normalizedSearchPath);
     if (file) return file;
 
-    // Get all files in the ZIP
     const allFiles = Object.keys(zip.files).map(normalizeFilePath);
 
-    // Try to find the file by matching the end of the path
     const matchingFile = allFiles.find(f => {
       const parts = f.split('/');
       const searchParts = normalizedSearchPath.split('/');
 
-      // Match from the end of the path
       for (let i = 1; i <= searchParts.length; i++) {
         if (parts[parts.length - i] !== searchParts[searchParts.length - i]) {
           return false;
@@ -105,7 +220,6 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       const searchParts = normalizedSearchPath.split('/');
       const entryParts = entryPath.split('/');
 
-      // Match from the end of the path
       let matches = true;
       for (let i = 1; i <= searchParts.length; i++) {
         if (entryParts[entryParts.length - i] !== searchParts[searchParts.length - i]) {
@@ -129,30 +243,29 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
 
     try {
       onStatusChange('processing');
-      setDebug([]);
+      addDebugLog('Starting file processing');
       const newFolderStats: FolderStats[] = [];
 
-      // Read the JSON file
       const jsonContent = await jsonFile.text();
       const config = JSON.parse(jsonContent);
+      addDebugLog('JSON configuration loaded successfully');
 
       if (!Array.isArray(config)) {
         throw new Error('Invalid JSON format: expected an array');
       }
 
-      setDebug(prev => [...prev, 'JSON config loaded successfully']);
-
       const processedZip = new JSZip();
 
       if (isTarFile(archiveFile)) {
-        // Handle TAR file
+        addDebugLog('Processing TAR file');
         const tarBuffer = await archiveFile.arrayBuffer();
-        setDebug(prev => [...prev, 'TAR file loaded successfully']);
 
         for (const folderConfig of config) {
           if (!folderConfig || typeof folderConfig !== 'object') continue;
 
-          const folderName = folderConfig['Review Test'];
+          const folderName = folderConfig['Review Text'];
+          addDebugLog(`Processing folder: ${folderName}`);
+
           const folderStat: FolderStats = {
             name: folderName,
             fileCount: 0,
@@ -160,24 +273,31 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
           };
 
           for (const link of folderConfig.Links || []) {
+            addDebugLog(`Processing file: ${link}`);
             const fileContent = await findFileInTar(tarBuffer, link);
             if (fileContent) {
               folderStat.fileCount++;
               const fileName = link.split('/').pop() || link;
               folderStat.files.push(fileName);
               processedZip.folder(folderName)?.file(fileName, fileContent);
+              addDebugLog(`Successfully processed file: ${fileName}`);
+            } else {
+              addDebugLog(`Warning: File not found: ${link}`);
             }
           }
 
           newFolderStats.push(folderStat);
         }
       } else {
+        addDebugLog('Processing ZIP file');
         const sourceZip = await JSZip.loadAsync(archiveFile);
 
         for (const folderConfig of config) {
           if (!folderConfig || typeof folderConfig !== 'object') continue;
 
-          const folderName = folderConfig['Review Test'];
+          const folderName = folderConfig['Review Text'];
+          addDebugLog(`Processing folder: ${folderName}`);
+
           const folderStat: FolderStats = {
             name: folderName,
             fileCount: 0,
@@ -185,6 +305,7 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
           };
 
           for (const link of folderConfig.Links || []) {
+            addDebugLog(`Processing file: ${link}`);
             const file = findFileInZip(sourceZip, link);
             if (file) {
               folderStat.fileCount++;
@@ -192,6 +313,9 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
               folderStat.files.push(fileName);
               const content = await file.async('uint8array');
               processedZip.folder(folderName)?.file(fileName, content);
+              addDebugLog(`Successfully processed file: ${fileName}`);
+            } else {
+              addDebugLog(`Warning: File not found: ${link}`);
             }
           }
 
@@ -203,13 +327,19 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       const processedBlob = await processedZip.generateAsync({ type: 'blob' });
       setProcessedZip(processedBlob);
       onStatusChange('success');
+      addDebugLog('File processing completed successfully');
     } catch (error) {
       console.error('Processing error:', error);
       const errorMessage = error instanceof Error ? error.message : 'An error occurred while processing the files';
       onError(errorMessage);
       onStatusChange('error');
-      setDebug(prev => [...prev, `Error: ${errorMessage}`]);
+      addDebugLog(`Error during processing: ${errorMessage}`);
     }
+  };
+
+  const handleDownloadClick = () => {
+    if (!processedZip) return;
+    setShowBatchIdModal(true);
   };
 
   const handleDownload = () => {
@@ -222,10 +352,64 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+      setShowBatchIdModal(false);
     } else {
       onError('Please enter a Batch ID before downloading');
     }
   };
+
+  const TreeView: React.FC<{ nodes: TreeNode[], level?: number }> = ({ nodes, level = 0 }) => {
+    return (
+        <div style={{ marginLeft: level ? '1.5rem' : '0' }}>
+          {nodes.map((node, index) => (
+              <div key={`${node.path}-${index}`}>
+                <div
+                    className="flex items-center gap-2 py-1 px-2 hover:bg-gray-50 rounded cursor-pointer"
+                    onClick={() => node.type === 'folder' && toggleNode(node.path)}
+                >
+                  {node.type === 'folder' ? (
+                      <>
+                        {expandedNodes.has(node.path) ? (
+                            <ChevronDown className="w-4 h-4 text-gray-500" />
+                        ) : (
+                            <ChevronRight className="w-4 h-4 text-gray-500" />
+                        )}
+                        <Folder className="w-4 h-4 text-blue-500" />
+                      </>
+                  ) : (
+                      <>
+                        <span className="w-4" />
+                        <File className="w-4 h-4 text-gray-400" />
+                      </>
+                  )}
+                  <span className="text-sm text-gray-700">{node.name}</span>
+                </div>
+                {node.type === 'folder' && expandedNodes.has(node.path) && node.children && (
+                    <TreeView nodes={node.children} level={level + 1} />
+                )}
+              </div>
+          ))}
+        </div>
+    );
+  };
+
+  const TabButton: React.FC<{
+    tab: TabType;
+    icon: React.ReactNode;
+    label: string;
+  }> = ({ tab, icon, label }) => (
+      <button
+          onClick={() => setActiveTab(tab)}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors
+        ${activeTab === tab
+              ? 'bg-blue-500 text-white'
+              : 'text-gray-600 hover:bg-gray-100'
+          }`}
+      >
+        {icon}
+        {label}
+      </button>
+  );
 
   return (
       <div className="space-y-6">
@@ -279,93 +463,143 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
           </div>
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex gap-4">
+          <button
+              onClick={processFiles}
+              disabled={!archiveFile || !jsonFile}
+              className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
+            ${archiveFile && jsonFile
+                  ? 'bg-blue-500 hover:bg-blue-600'
+                  : 'bg-gray-300 cursor-not-allowed'
+              }`}
+          >
+            <FolderTree className="w-5 h-5" />
+            Process Files
+          </button>
+
           {processedZip && (
-              <div className="bg-white rounded-lg shadow-md p-6">
-                <div className="mb-4">
-                  <label htmlFor="batchId" className="block text-sm font-medium text-gray-700 mb-2">
-                    Enter Batch ID
-                  </label>
-                  <input
-                      type="text"
-                      id="batchId"
-                      value={batchId}
-                      onChange={(e) => setBatchId(e.target.value)}
-                      placeholder="Enter batch ID for download"
-                      className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              <button
+                  onClick={handleDownloadClick}
+                  className="flex-1 py-3 px-4 rounded-lg text-white font-medium bg-green-500 hover:bg-green-600 flex items-center justify-center gap-2"
+              >
+                <Download className="w-5 h-5" />
+                Download Processed Files
+              </button>
+          )}
+        </div>
+
+        {(fileTree.length > 0 || folderStats.length > 0 || debug.length > 0) && (
+            <div className="bg-white rounded-lg shadow-md overflow-hidden">
+              <div className="border-b border-gray-200 p-4">
+                <div className="flex gap-4">
+                  <TabButton
+                      tab="input"
+                      icon={<FolderTree className="w-5 h-5" />}
+                      label="Input Structure"
+                  />
+                  <TabButton
+                      tab="logs"
+                      icon={<Terminal className="w-5 h-5" />}
+                      label="Logs"
+                  />
+                  <TabButton
+                      tab="output"
+                      icon={<Layers className="w-5 h-5" />}
+                      label="Output Structure"
                   />
                 </div>
               </div>
-          )}
 
-          <div className="flex gap-4">
-            <button
-                onClick={processFiles}
-                disabled={!archiveFile || !jsonFile}
-                className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
-              ${archiveFile && jsonFile
-                    ? 'bg-blue-500 hover:bg-blue-600'
-                    : 'bg-gray-300 cursor-not-allowed'
-                }`}
-            >
-              <FolderTree className="w-5 h-5" />
-              Process Files
-            </button>
-
-            {processedZip && (
-                <button
-                    onClick={handleDownload}
-                    disabled={!batchId.trim()}
-                    className={`flex-1 py-3 px-4 rounded-lg text-white font-medium flex items-center justify-center gap-2
-                ${batchId.trim()
-                        ? 'bg-green-500 hover:bg-green-600'
-                        : 'bg-gray-300 cursor-not-allowed'
-                    }`}
-                >
-                  <Download className="w-5 h-5" />
-                  Download Processed Files
-                </button>
-            )}
-          </div>
-        </div>
-
-        {folderStats.length > 0 && (
-            <div className="bg-white rounded-lg shadow-md p-6">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                <FolderTree className="w-5 h-5 text-blue-500" />
-                File Structure
-              </h3>
-              <div className="space-y-4">
-                {folderStats.map((folder, index) => (
-                    <div key={index} className="border border-gray-100 rounded-lg p-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Folder className="w-5 h-5 text-blue-500" />
-                        <span className="font-medium text-gray-800">{folder.name}</span>
-                        <span className="text-sm text-gray-500">({folder.fileCount} files)</span>
-                      </div>
-                      <div className="ml-6 space-y-1">
-                        {folder.files.map((file, fileIndex) => (
-                            <div key={fileIndex} className="flex items-center gap-2 text-sm text-gray-600">
-                              <File className="w-4 h-4 text-gray-400" />
-                              {file}
-                            </div>
-                        ))}
+              <div className="p-6">
+                {activeTab === 'input' && archiveFile && (
+                    <div className="space-y-4">
+                      <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                        <FolderTree className="w-5 h-5 text-blue-500" />
+                        Input File: {archiveFile.name}
+                      </h3>
+                      <div className="border border-gray-100 rounded-lg p-4">
+                        <TreeView nodes={fileTree} />
                       </div>
                     </div>
-                ))}
+                )}
+
+                {activeTab === 'output' && folderStats.length > 0 && (
+                    <div className="space-y-4">
+                      <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                        <Layers className="w-5 h-5 text-blue-500" />
+                        Processed Structure
+                      </h3>
+                      {folderStats.map((folder, index) => (
+                          <div key={index} className="border border-gray-100 rounded-lg p-4">
+                            <div className="flex items-center gap-2 mb-2">
+                              <Folder className="w-5 h-5 text-blue-500" />
+                              <span className="font-medium text-gray-800">{folder.name}</span>
+                              <span className="text-sm text-gray-500">({folder.fileCount} files)</span>
+                            </div>
+                            <div className="ml-6 space-y-1">
+                              {folder.files.map((file, fileIndex) => (
+                                  <div key={fileIndex} className="flex items-center gap-2 text-sm text-gray-600">
+                                    <File className="w-4 h-4 text-gray-400" />
+                                    {file}
+                                  </div>
+                              ))}
+                            </div>
+                          </div>
+                      ))}
+                    </div>
+                )}
+
+                {activeTab === 'logs' && debug.length > 0 && (
+                    <div className="space-y-2">
+                      <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                        <Terminal className="w-5 h-5 text-blue-500" />
+                        Processing Logs
+                      </h3>
+                      <div className="bg-gray-50 rounded-lg p-4">
+                        <div className="font-mono text-sm text-gray-600 space-y-1">
+                          {debug.map((log, index) => (
+                              <div key={index} className="border-l-2 border-gray-300 pl-2">
+                                {log}
+                              </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                )}
               </div>
             </div>
         )}
 
-        {debug.length > 0 && (
-            <div className="mt-6 p-4 bg-gray-50 rounded-lg">
-              <h3 className="text-sm font-medium text-gray-700 mb-2">Processing Log:</h3>
-              <div className="text-xs font-mono text-gray-600 space-y-1">
-                {debug.map((log, index) => (
-                    <div key={index} className="border-l-2 border-gray-300 pl-2">
-                      {log}
-                    </div>
-                ))}
+        {showBatchIdModal && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+              <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Enter Batch ID</h3>
+                <input
+                    type="text"
+                    value={batchId}
+                    onChange={(e) => setBatchId(e.target.value)}
+                    placeholder="Enter batch ID for download"
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 mb-4"
+                />
+                <div className="flex gap-4">
+                  <button
+                      onClick={() => setShowBatchIdModal(false)}
+                      className="flex-1 py-2 px-4 rounded-lg text-gray-700 bg-gray-100 hover:bg-gray-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                      onClick={handleDownload}
+                      disabled={!batchId.trim()}
+                      className={`flex-1 py-2 px-4 rounded-lg text-white font-medium
+                  ${batchId.trim()
+                          ? 'bg-blue-500 hover:bg-blue-600'
+                          : 'bg-gray-300 cursor-not-allowed'
+                      }`}
+                  >
+                    Download
+                  </button>
+                </div>
               </div>
             </div>
         )}
