@@ -14,9 +14,18 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
   const [processedZip, setProcessedZip] = useState<Blob | null>(null);
   const [debug, setDebug] = useState<string[]>([]);
 
+  const isZipFile = (file: File): boolean => {
+    // Check both MIME type and file extension
+    return (
+        file.type === 'application/zip' ||
+        file.type === 'application/x-zip-compressed' ||
+        file.name.toLowerCase().endsWith('.zip')
+    );
+  };
+
   const handleZipChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file && file.type === 'application/zip') {
+    if (file && isZipFile(file)) {
       setZipFile(file);
       setProcessedZip(null);
       setDebug([]);
