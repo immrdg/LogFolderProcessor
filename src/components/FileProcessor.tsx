@@ -64,24 +64,46 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
     });
   };
 
-  const toggleOutputFolder = (folderName: string) => {
-    setExpandedOutputFolders(prev => {
-      const next = new Set(prev);
-      if (next.has(folderName)) {
-        next.delete(folderName);
-      } else {
-        next.add(folderName);
-      }
-      return next;
-    });
-  };
-
   const calculateFileStats = async (file: JSZip.JSZipObject): Promise<{ isEmpty: boolean; size: number }> => {
     const content = await file.async('uint8array');
     return {
       isEmpty: content.length === 0,
       size: content.length
     };
+  };
+
+  const updateFolderStats = (node: TreeNode) => {
+    if (node.type === 'folder' && node.children) {
+      let empty = 0;
+      let nonEmpty = 0;
+      let total = 0;
+
+      const processNode = (n: TreeNode) => {
+        if (n.type === 'file') {
+          total++;
+          if (n.size === 0) {
+            empty++;
+          } else {
+            nonEmpty++;
+          }
+        } else if (n.children) {
+          n.children.forEach(processNode);
+        }
+      };
+
+      node.children.forEach(processNode);
+
+      node.fileStats = {
+        empty,
+        nonEmpty,
+        total
+      };
+
+      // Recursively update stats for child folders
+      node.children
+          .filter(child => child.type === 'folder')
+          .forEach(updateFolderStats);
+    }
   };
 
   const buildFileTree = async (file: File) => {
@@ -120,22 +142,6 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
                 const zipFile = zip.files[path];
                 const { isEmpty, size } = await calculateFileStats(zipFile);
                 node.size = size;
-
-                // Update parent folder stats
-                let parentPath = currentPath.split('/').slice(0, -1).join('/');
-                let parentNode = tree[0];
-                for (const parentPart of parentPath.split('/')) {
-                  if (!parentNode) break;
-                  if (parentNode.fileStats) {
-                    parentNode.fileStats.total++;
-                    if (isEmpty) {
-                      parentNode.fileStats.empty++;
-                    } else {
-                      parentNode.fileStats.nonEmpty++;
-                    }
-                  }
-                  parentNode = parentNode.children?.find(n => n.name === parentPart);
-                }
               }
 
               currentLevel.push(node);
@@ -151,6 +157,9 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
           await processNode(path, tree);
         }
 
+        // Update folder statistics after all files are processed
+        tree.forEach(updateFolderStats);
+
         addDebugLog(`Successfully built tree structure with ${files.length} entries`);
       }
 
@@ -160,6 +169,18 @@ const FileProcessor: React.FC<FileProcessorProps> = ({ onStatusChange, onError }
       addDebugLog(`Error building file tree: ${errorMessage}`);
       onError(`Failed to process file structure: ${errorMessage}`);
     }
+  };
+
+  const toggleOutputFolder = (folderName: string) => {
+    setExpandedOutputFolders(prev => {
+      const next = new Set(prev);
+      if (next.has(folderName)) {
+        next.delete(folderName);
+      } else {
+        next.add(folderName);
+      }
+      return next;
+    });
   };
 
   const determineOperation = (link: string): 'insert' | 'update' => {
